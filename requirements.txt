@@ -1,4 +1,6 @@
-python-telegram-bot==20.8
-requests
-matplotlib
+python-telegram-bot==20.7
+ccxt
 pandas
+numpy
+ta-lib  # Kalau error, ganti dengan 'TA-Lib' atau skip untuk versi sederhana
+requests
