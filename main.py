@@ -1,98 +1,132 @@
 import os
-import re
-import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import asyncio
+import ccxt
+import pandas as pd
+import numpy as np
+from telegram import Bot
 from telegram.constants import ParseMode
 
-BOT_TOKEN = os.getenv("BOT_TOKEN
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CHANNEL_ID = os.getenv('CHANNEL_ID')
 
-def get_token_info(ca):
-    # Coba semua chain populer otomatis
-    chains = ["solana", "ethereum", "base", "bsc", "arbitrum"]
-    headers = {'User-Agent': 'Mozilla/5.0'}
+# Setup Binance Futures
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
+
+def get_data(symbol, timeframe='5m', limit=100):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
+
+def calculate_indicators(df):
+    df['ema9'] = df['close'].ewm(span=9).mean()
+    df['ema21'] = df['close'].ewm(span=21).mean()
+    df['rsi'] = compute_rsi(df['close'], 14)
+    df['volume_ma'] = df['volume'].rolling(20).mean()
+    return df
+
+def compute_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def generate_signal(df, symbol):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    for chain in chains:
-        if chain == "solana":
-            url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{ca}"
-        else:
-            url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{ca}"
+    # EMA Cross
+    ema_bull = last['ema9'] > last['ema21'] and prev['ema9'] <= prev['ema21']
+    ema_bear = last['ema9'] < last['ema21'] and prev['ema9'] >= prev['ema21']
+    
+    # RSI Divergence simple
+    rsi_oversold = last['rsi'] < 30
+    rsi_overbought = last['rsi'] > 70
+    
+    # Volume Spike
+    vol_spike = last['volume'] > last['volume_ma'] * 1.5
+    
+    direction = None
+    reason = ""
+    confidence = 0
+    
+    if ema_bull and rsi_oversold and vol_spike:
+        direction = "LONG"
+        reason = "EMA Bull Cross + RSI Oversold + Volume Spike"
+        confidence = 85
+    elif ema_bear and rsi_overbought and vol_spike:
+        direction = "SHORT"
+        reason = "EMA Bear Cross + RSI Overbought + Volume Spike"
+        confidence = 85
+    
+    if direction:
+        current_price = last['close']
+        entry_low = current_price * 0.997  # 0.3% below
+        entry_high = current_price * 1.003
+        sl = current_price * 0.985 if direction == "LONG" else current_price * 1.015
+        tp1 = current_price * 1.007 if direction == "LONG" else current_price * 0.993
+        tp2 = current_price * 1.014
+        tp3 = current_price * 1.023
+        tp4 = current_price * 1.038
+        risk = 1.5  # %
         
-        try:
-            r = requests.get(url, headers=headers, timeout=8)
-            data = r.json()
-            if "pair" in data and data["pair"]:
-                return data["pair"]
-            elif "pairs" in data and data["pairs"]:
-                return data["pairs"][0]
-        except:
-            continue
+        signal = {
+            'direction': direction,
+            'symbol': symbol,
+            'entry_low': round(entry_low, 2),
+            'entry_high': round(entry_high, 2),
+            'tp1': round(tp1, 2),
+            'tp2': round(tp2, 2),
+            'tp3': round(tp3, 2),
+            'tp4': round(tp4, 2),
+            'sl': round(sl, 2),
+            'reason': reason,
+            'confidence': confidence,
+            'leverage': '10-20x'
+        }
+        return signal
     return None
 
-def format_message(pair):
-    if not pair:
-        return "Token tidak ditemukan atau belum listing di DEX mana pun."
-    
-    b = pair["baseToken"]
-    q = pair["quoteToken"]
-    p = pair.get("priceUsd", "0")
-    pc = pair.get("priceChange", {})
-    
-    liq = pair.get("liquidity", {}).get("usd", 0)
-    fdv = pair.get("fdv", 0)
-    vol = pair.get("volume", {}).get("h24", 0)
-    
-    return f"""
-*ANALISIS TOKEN* 
+async def send_signal(signal):
+    bot = Bot(token=BOT_TOKEN)
+    message = f"""
+🔥 **{signal['direction']} SIGNAL** | {signal['symbol']} Perpetual 🔥
 
-*Token*: {b['symbol']} ({b['name']})
-*Address*: `{b['address']}`
-*Chain*: {pair['chainId'].title()}
+📈 **Entry Zone**: ${signal['entry_low']} – ${signal['entry_high']}
+🎯 **TP1**: ${signal['tp1']} (1.5%)
+🎯 **TP2**: ${signal['tp2']} (2.5%)
+🎯 **TP3**: ${signal['tp3']} (4%)
+🎯 **TP4**: ${signal['tp4']} (6%)
+🛑 **SL**: ${signal['sl']} (1.5% Risk)
 
-*Harga*: $${float(p):.10f}
-*5m*: {pc.get('m5',0)}% | *1h*: {pc.get('h1',0)}% | *24h*: {pc.get('h24',0)}%
+⚡ **Reason**: {signal['reason']}
+💪 **Leverage Sugesti**: {signal['leverage']} | Confidence: {signal['confidence']}%
 
-*Liquidity*: ${liq:,.0f}
-*FDV*: ${fdv:,.0f}
-*Volume 24h*: ${vol:,.0f}
+#Futures #CryptoSignals | @YourChannel
+    """
+    await bot.send_message(chat_id=CHANNEL_ID, text=message.strip(), parse_mode=ParseMode.MARKDOWN)
 
-{Buka di DexScreener → {pair['url']}
-    """.strip()
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Halo! Bot Analisis Token GRATIS \n\n"
-        "Kirim Contract Address (CA) token apa saja (Solana, ETH, Base, BSC, dll)\n"
-        "Contoh:\n"
-        "So1eveMent9W1z1Qh7YV7Z9YbS5dX8m5tW1z1Qh7YV7Z9YbS5dX8m5t\n"
-        "0x1234567890abcdef1234567890abcdef12345678",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    # Cari contract address (panjang 32–44 karakter)
-    match = re.search(r"[1-9A-HJ-NP-Za-km-z]{32,44}", text)
-    if not match:
-        await update.message.reply_text("Kirim Contract Address yang valid ya!")
-        return
+async def main():
+    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT']  # Tambah lebih banyak kalau mau
+    print("Bot sinyal futures dimulai...")
     
-    ca = match.group(0)
-    msg = await update.message.reply_text("Sedang menganalisis token...")
-    
-    pair = get_token_info(ca)
-    result = format_message(pair)
-    
-    await msg.edit_text(result, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("Bot sedang berjalan...")
-    app.run_polling()
+    while True:
+        for symbol in symbols:
+            try:
+                df = get_data(symbol)
+                df = calculate_indicators(df)
+                signal = generate_signal(df, symbol)
+                if signal:
+                    await send_signal(signal)
+                    print(f"Sinyal {signal['direction']} untuk {symbol} dikirim!")
+            except Exception as e:
+                print(f"Error {symbol}: {e}")
+        
+        await asyncio.sleep(300)  # Scan setiap 5 menit
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
